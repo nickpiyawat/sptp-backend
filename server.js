@@ -359,6 +359,6 @@ app.put('/matches/:id/reset', async (req, res) => {
 });
 
 // เริ่มเปิดเซิร์ฟเวอร์
-app.listen(port, () => {
+app.listen(PORT, () => {
   console.log(`Server กำลังรันอยู่ที่ http://localhost:${port}`);
 });
