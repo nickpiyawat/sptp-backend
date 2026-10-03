@@ -248,7 +248,7 @@ app.get('/tournaments/:id/standings', async (req, res) => {
     res.status(500).json({ error: 'คำนวณตารางคะแนนไม่ได้' });
   }
 });
-// 9. API จัดตารางบอลถ้วย (จับคู่รอบแรก และดึงคนชนะเข้ารอบต่อไป)
+// 9. API จัดตารางบอลถ้วย (จับคู่รอบแรกเพิ่ม "ชนะบาย" อัตโนมัติ และสุ่มใหม่ทุกรอบ)
 app.post('/tournaments/:id/generate-knockout', async (req, res) => {
   try {
     const tournamentId = req.params.id;
@@ -259,9 +259,36 @@ app.post('/tournaments/:id/generate-knockout', async (req, res) => {
     let teamsToPair = [];
 
     if (existingMatches.length === 0) {
-      // 📌 กรณียังไม่มีแมตช์เลย (เพิ่งสร้าง) -> ดึงทีมทั้งหมดมาจับคู่รอบแรก
+      // 📌 กรณียังไม่มีแมตช์เลย (เพิ่งสร้าง) -> ดึงทีมทั้งหมดมา
       const teamsRes = await pool.query('SELECT team_id FROM tournament_teams WHERE tournament_id = $1', [tournamentId]);
       teamsToPair = teamsRes.rows.map(t => t.team_id);
+
+      // ✅ 1. คำนวณหาจำนวนทีมที่ต้องใช้ (2, 4, 8, 16, 32, 64...)
+      let target = 2;
+      while (target < teamsToPair.length) {
+        target *= 2;
+      }
+      
+      const byesNeeded = target - teamsToPair.length;
+
+      // ✅ 2. สร้างทีม "ชนะบาย" เข้าไปเติมให้เต็มสาย
+      for (let i = 0; i < byesNeeded; i++) {
+        // สร้างทีมชื่อ ชนะบาย ลงฐานข้อมูล
+        const byeRes = await pool.query(
+          "INSERT INTO teams (name, logo_url) VALUES ($1, $2) RETURNING id",
+          ['ชนะบาย', '']
+        );
+        const byeId = byeRes.rows[0].id;
+        
+        // ผูกทีม ชนะบาย เข้ากับทัวร์นาเมนต์นี้
+        await pool.query(
+          "INSERT INTO tournament_teams (tournament_id, team_id) VALUES ($1, $2)",
+          [tournamentId, byeId]
+        );
+        
+        teamsToPair.push(byeId); // เอาไปรอจับคู่
+      }
+
     } else {
       // 📌 กรณีมีแมตช์แล้ว -> หารอบล่าสุด และดึงเฉพาะ "ผู้ชนะ" เข้ารอบ
       const lastRound = existingMatches[existingMatches.length - 1].match_round;
@@ -280,6 +307,13 @@ app.post('/tournaments/:id/generate-knockout', async (req, res) => {
     // ถ้าเหลือทีมเดียว แปลว่าได้แชมป์แล้ว
     if (teamsToPair.length === 1) {
       return res.json({ message: '🏆 ได้ทีมแชมป์เรียบร้อยแล้ว!' });
+    }
+
+    // ✅ 3. ระบบสุ่มจับคู่อัตโนมัติ (Shuffle) ให้มั่วใหม่ทุกรอบ
+    for (let i = teamsToPair.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      // สลับตำแหน่งทีมใน Array
+      [teamsToPair[i], teamsToPair[j]] = [teamsToPair[j], teamsToPair[i]];
     }
 
     // ตั้งชื่อรอบให้สวยงาม
