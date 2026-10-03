@@ -248,93 +248,99 @@ app.get('/tournaments/:id/standings', async (req, res) => {
     res.status(500).json({ error: 'คำนวณตารางคะแนนไม่ได้' });
   }
 });
-// 9. API จัดตารางบอลถ้วย (จับคู่รอบแรกเพิ่ม "ชนะบาย" อัตโนมัติ และสุ่มใหม่ทุกรอบ)
+// 9. API จัดตารางบอลถ้วย (ป้องกัน ชนะบาย เจอกันเอง + สุ่มใหม่ทุกรอบ)
 app.post('/tournaments/:id/generate-knockout', async (req, res) => {
   try {
     const tournamentId = req.params.id;
-    // ดึงแมตช์ทั้งหมดที่มีในตอนนี้ เพื่อเช็กว่าเคยเตะไปหรือยัง
     const matchRes = await pool.query('SELECT * FROM matches WHERE tournament_id = $1 ORDER BY id ASC', [tournamentId]);
     const existingMatches = matchRes.rows;
 
     let teamsToPair = [];
 
     if (existingMatches.length === 0) {
-      // 📌 กรณียังไม่มีแมตช์เลย (เพิ่งสร้าง) -> ดึงทีมทั้งหมดมา
+      // 📌 กรณียังไม่มีแมตช์ (รอบแรก)
       const teamsRes = await pool.query('SELECT team_id FROM tournament_teams WHERE tournament_id = $1', [tournamentId]);
-      teamsToPair = teamsRes.rows.map(t => t.team_id);
+      let realTeams = teamsRes.rows.map(t => t.team_id);
 
-      // ✅ 1. คำนวณหาจำนวนทีมที่ต้องใช้ (2, 4, 8, 16, 32, 64...)
+      // คำนวณหาจำนวนทีมที่ต้องใช้ (2, 4, 8, 16, 32...)
       let target = 2;
-      while (target < teamsToPair.length) {
-        target *= 2;
+      while (target < realTeams.length) target *= 2;
+      const byesNeeded = target - realTeams.length;
+
+      // สร้างทีม "ชนะบาย" 
+      let byeIds = [];
+      for (let i = 0; i < byesNeeded; i++) {
+        const byeRes = await pool.query("INSERT INTO teams (name, logo_url) VALUES ($1, $2) RETURNING id", ['ชนะบาย', '']);
+        const byeId = byeRes.rows[0].id;
+        await pool.query("INSERT INTO tournament_teams (tournament_id, team_id) VALUES ($1, $2)", [tournamentId, byeId]);
+        byeIds.push(byeId);
+      }
+
+      // ✅ สลับตำแหน่งทีมคนจริงๆ ก่อนจับคู่
+      for (let i = realTeams.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [realTeams[i], realTeams[j]] = [realTeams[j], realTeams[i]];
+      }
+
+      let pairedMatches = [];
+      
+      // ✅ 1. บังคับเอาทีม ชนะบาย ประกบกับทีมคนจริงๆ เสมอ (ป้องกันบายเจอบาย)
+      for (let i = 0; i < byeIds.length; i++) {
+        pairedMatches.push({ home: realTeams.pop(), away: byeIds[i] });
       }
       
-      const byesNeeded = target - teamsToPair.length;
+      // ✅ 2. เอาทีมคนจริงๆ ที่เหลืออยู่ มาจับคู่กันเอง
+      while(realTeams.length > 0) {
+        pairedMatches.push({ home: realTeams.pop(), away: realTeams.pop() });
+      }
 
-      // ✅ 2. สร้างทีม "ชนะบาย" เข้าไปเติมให้เต็มสาย
-      for (let i = 0; i < byesNeeded; i++) {
-        // สร้างทีมชื่อ ชนะบาย ลงฐานข้อมูล
-        const byeRes = await pool.query(
-          "INSERT INTO teams (name, logo_url) VALUES ($1, $2) RETURNING id",
-          ['ชนะบาย', '']
-        );
-        const byeId = byeRes.rows[0].id;
-        
-        // ผูกทีม ชนะบาย เข้ากับทัวร์นาเมนต์นี้
-        await pool.query(
-          "INSERT INTO tournament_teams (tournament_id, team_id) VALUES ($1, $2)",
-          [tournamentId, byeId]
-        );
-        
-        teamsToPair.push(byeId); // เอาไปรอจับคู่
+      // ✅ 3. สลับลำดับ "คู่แข่งทั้งหมด" อีกรอบ เพื่อไม่ให้คู่ที่มีชนะบายไปกองอยู่บนสุด
+      for (let i = pairedMatches.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pairedMatches[i], pairedMatches[j]] = [pairedMatches[j], pairedMatches[i]];
+      }
+
+      // นำคู่ที่จัดแล้ว มาเรียงใส่ Array หลัก (สุ่มให้ชนะบายอยู่ฝั่งซ้ายบ้าง ขวาบ้าง)
+      teamsToPair = [];
+      for (let m of pairedMatches) {
+        if(Math.random() > 0.5) { teamsToPair.push(m.home, m.away); } 
+        else { teamsToPair.push(m.away, m.home); }
       }
 
     } else {
-      // 📌 กรณีมีแมตช์แล้ว -> หารอบล่าสุด และดึงเฉพาะ "ผู้ชนะ" เข้ารอบ
+      // 📌 กรณีมีแมตช์แล้ว -> คัดเฉพาะ "ผู้ชนะ" เข้ารอบ
       const lastRound = existingMatches[existingMatches.length - 1].match_round;
       const lastRoundMatches = existingMatches.filter(m => m.match_round === lastRound);
 
       for (let m of lastRoundMatches) {
         if (!m.is_played) return res.status(400).json({ error: 'ต้องกรอกผลรอบนี้ให้ครบทุกคู่ก่อนครับ' });
-        if (m.home_score === m.away_score) return res.status(400).json({ error: 'บอลถ้วยห้ามเสมอ! (ให้รวมผลจุดโทษเข้าไปในสกอร์ได้เลยครับ)' });
-        
-        // คัดคนชนะ
+        if (m.home_score === m.away_score) return res.status(400).json({ error: 'บอลถ้วยห้ามเสมอ! (ให้รวมผลจุดโทษเข้าไปในสกอร์ได้เลย)' });
         if (m.home_score > m.away_score) teamsToPair.push(m.home_team_id);
         else teamsToPair.push(m.away_team_id);
       }
+
+      // สุ่มจับฉลากใหม่ทุกรอบ (Shuffle ผู้ชนะ)
+      for (let i = teamsToPair.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [teamsToPair[i], teamsToPair[j]] = [teamsToPair[j], teamsToPair[i]];
+      }
     }
 
-    // ถ้าเหลือทีมเดียว แปลว่าได้แชมป์แล้ว
-    if (teamsToPair.length === 1) {
-      return res.json({ message: '🏆 ได้ทีมแชมป์เรียบร้อยแล้ว!' });
-    }
+    if (teamsToPair.length === 1) return res.json({ message: '🏆 ได้ทีมแชมป์เรียบร้อยแล้ว!' });
 
-    // ✅ 3. ระบบสุ่มจับคู่อัตโนมัติ (Shuffle) ให้มั่วใหม่ทุกรอบ
-    for (let i = teamsToPair.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      // สลับตำแหน่งทีมใน Array
-      [teamsToPair[i], teamsToPair[j]] = [teamsToPair[j], teamsToPair[i]];
-    }
-
-    // ตั้งชื่อรอบให้สวยงาม
     let roundName = `รอบ ${teamsToPair.length} ทีม`;
     if (teamsToPair.length === 4) roundName = 'รอบรองชนะเลิศ';
     if (teamsToPair.length === 2) roundName = 'รอบชิงชนะเลิศ';
 
-    // จับคู่และสร้างแมตช์ลงฐานข้อมูล
-    let matchCount = 0;
     for (let i = 0; i < teamsToPair.length; i += 2) {
-      let home = teamsToPair[i];
-      let away = teamsToPair[i+1];
-      if (home && away) {
+      if (teamsToPair[i] && teamsToPair[i+1]) {
         await pool.query(
           'INSERT INTO matches (tournament_id, home_team_id, away_team_id, match_round) VALUES ($1, $2, $3, $4)',
-          [tournamentId, home, away, roundName]
+          [tournamentId, teamsToPair[i], teamsToPair[i+1], roundName]
         );
-        matchCount++;
       }
     }
-    res.json({ message: `สร้างตาราง ${roundName} สำเร็จ!` });
+    res.json({ message: `สร้างตารางสำเร็จ!`, newRound: roundName });
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: 'เกิดข้อผิดพลาดในการสร้างบอลถ้วย' });
